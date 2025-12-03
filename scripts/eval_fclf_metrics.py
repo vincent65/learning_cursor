@@ -340,6 +340,7 @@ def main() -> None:
     entanglement_path = output_dir / "entanglement_curves.json"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    lines: List[str] = [f"Checkpoint: {ckpt_path}", ""]
 
     train_split, val_split, _ = load_embeddings_splits(embedding_dir)
     target_attrs = ["Smiling", "Young", "Male", "Eyeglasses", "Mustache"]
@@ -359,8 +360,10 @@ def main() -> None:
     raw_probe_results = eval_linear_probes(raw_probe_models, X_val_raw, Y_val)
 
     print("=== Linear probes on RAW CLIP embeddings ===")
+    lines.append("=== Linear probes on RAW CLIP embeddings ===")
     for attr_name, (acc, f1) in raw_probe_results.items():
         print(f"{attr_name:10s} | val_acc = {acc: .4f} | val_f1 = {f1: .4f}")
+        lines.append(f"{attr_name:10s} | val_acc = {acc: .4f} | val_f1 = {f1: .4f}")
 
     # Load model and compute flowed embeddings
     fallback_cfg = FCLFConfig()
@@ -388,8 +391,11 @@ def main() -> None:
     flow_probe_results = eval_linear_probes(flow_probe_models, X_val_flow_np, Y_val)
 
     print("\n=== Linear probes on FCLF-FLOWED embeddings ===")
+    lines.append("")
+    lines.append("=== Linear probes on FCLF-FLOWED embeddings ===")
     for attr_name, (acc, f1) in flow_probe_results.items():
         print(f"{attr_name:10s} | val_acc = {acc: .4f} | val_f1 = {f1: .4f}")
+        lines.append(f"{attr_name:10s} | val_acc = {acc: .4f} | val_f1 = {f1: .4f}")
 
     # Clustering + neighborhood purity on validation split
     from sklearn.utils import shuffle as sk_shuffle
@@ -403,6 +409,8 @@ def main() -> None:
     Y_flow_sub = Y_flow_sub[:max_points]
 
     print("\n=== Clustering and neighborhood metrics (VAL subset) ===")
+    lines.append("")
+    lines.append("=== Clustering and neighborhood metrics (VAL subset) ===")
     for j, attr_name in enumerate(target_attrs):
         y_raw_attr = Y_raw_sub[:, j]
         y_flow_attr = Y_flow_sub[:, j]
@@ -417,6 +425,13 @@ def main() -> None:
         nn_purity_flow = neighborhood_purity(X_flow_sub, y_flow_attr, k=10)
 
         print(
+            f"{attr_name:10s} | "
+            f"sil_raw={sil_raw: .3f}, sil_flow={sil_flow: .3f} | "
+            f"db_raw={db_raw: .3f}, db_flow={db_flow: .3f} | "
+            f"purity_raw={purity_raw: .3f}, purity_flow={purity_flow: .3f} | "
+            f"NNpur_raw={nn_purity_raw: .3f}, NNpur_flow={nn_purity_flow: .3f}"
+        )
+        lines.append(
             f"{attr_name:10s} | "
             f"sil_raw={sil_raw: .3f}, sil_flow={sil_flow: .3f} | "
             f"db_raw={db_raw: .3f}, db_flow={db_flow: .3f} | "
