@@ -43,6 +43,7 @@ from scripts.viz_utils import plot_flow_losses
 HP_DIR = Path("eval/hp_search")
 RUNS_DIR = Path("eval/hp_runs")
 
+TARGET_ATTRS = ["Smiling", "Young", "Male", "Eyeglasses", "Mustache"]
 DATASET_TO_ATTR = {
     "celeba_smiling": "Smiling",
     "celeba_young": "Young",
@@ -50,6 +51,7 @@ DATASET_TO_ATTR = {
     "celeba_eyeglasses": "Eyeglasses",
     "celeba_mustache": "Mustache",
 }
+ATTR_TO_DATASET = {attr: dataset for dataset, attr in DATASET_TO_ATTR.items()}
 ALL_DATASETS = list(DATASET_TO_ATTR.keys())
 
 
@@ -217,11 +219,10 @@ def run_experiment(
         if plotted:
             loss_plot_path = plotted
 
-    target_attrs_full = ["Smiling", "Young", "Male", "Eyeglasses", "Mustache"]
-    attr_indices = get_attribute_indices(train_split.attr_names, target_attrs_full)
+    attr_indices = get_attribute_indices(train_split.attr_names, TARGET_ATTRS)
     train_attrs_full = select_attributes(train_split, attr_indices)
     val_attrs_full = select_attributes(val_split, attr_indices)
-    attr_col = target_attrs_full.index(target_attr)
+    attr_col = TARGET_ATTRS.index(target_attr)
     train_labels = train_attrs_full[:, attr_col]
     val_labels = val_attrs_full[:, attr_col]
 
