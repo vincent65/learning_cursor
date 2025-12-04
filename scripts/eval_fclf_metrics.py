@@ -175,6 +175,7 @@ def compute_flowed_embeddings(
         num_workers=0,
         pin_memory=True,
     )
+    model = model.to(device)
     model.eval()
 
     flowed_chunks: List[torch.Tensor] = []
