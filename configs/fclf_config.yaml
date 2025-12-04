@@ -20,3 +20,9 @@ loss:
 inference:
   num_flow_steps: 20  # MODERATE_FIX: Increased from 10 for smoother trajectories
   step_size: 0.05  # MODERATE_FIX: Reduced from 0.1 for finer-grained flow
+
+ablation:
+  use_contrastive: true
+  use_curl: true
+  use_div: true
+  use_label_condition: true

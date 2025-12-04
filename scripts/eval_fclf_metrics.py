@@ -1,11 +1,14 @@
 import argparse
 import os
 import json
+import csv
 from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+import matplotlib.pyplot as plt
 
 import sys
 from pathlib import Path
@@ -20,6 +23,7 @@ from celeba_embeddings import (
     select_attributes,
 )
 from fclf_model import FCLFConfig, ConditionalVectorField, integrate_flow
+from scripts.viz_utils import plot_pca_umap
 
 
 class EmbeddingDataset(Dataset):
@@ -37,6 +41,102 @@ class EmbeddingDataset(Dataset):
 
 def _to_numpy(t: torch.Tensor) -> np.ndarray:
     return t.detach().cpu().numpy()
+
+
+def save_confusion_artifacts(
+    method: str,
+    attr_name: str,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    output_dir: Path,
+) -> None:
+    from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    labels = [0, 1]
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    cm_path = output_dir / f"confusion_{method}_{attr_name.lower()}.csv"
+    np.savetxt(cm_path, cm.astype(int), delimiter=",", fmt="%d")
+
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_true, y_pred, labels=labels, zero_division=0
+    )
+    per_class_path = output_dir / f"per_class_{method}_{attr_name.lower()}.csv"
+    with per_class_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["label", "precision", "recall", "f1", "support"])
+        writer.writeheader()
+        for idx, label in enumerate(labels):
+            writer.writerow(
+                {
+                    "label": label,
+                    "precision": float(precision[idx]),
+                    "recall": float(recall[idx]),
+                    "f1": float(f1[idx]),
+                    "support": int(support[idx]),
+                }
+            )
+
+    plt.figure(figsize=(4, 3.5))
+    plt.imshow(cm, interpolation="nearest", cmap="Blues")
+    plt.title(f"{method} – {attr_name}")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, int(cm[i, j]), ha="center", va="center", color="black")
+    plt.xticks([0, 1], labels)
+    plt.yticks([0, 1], labels)
+    plt.tight_layout()
+    heatmap_path = output_dir / f"confusion_{method}_{attr_name.lower()}.png"
+    plt.savefig(heatmap_path, dpi=200)
+    plt.close()
+
+
+def compute_global_direction(
+    embeddings: torch.Tensor,
+    attrs: torch.Tensor,
+    attr_idx: int,
+) -> torch.Tensor:
+    """
+    Estimate a global editing direction d = mu_pos - mu_neg for a binary attribute.
+    Returns a normalized vector.
+    """
+    device = embeddings.device
+    mask_pos = attrs[:, attr_idx] == 1
+    mask_neg = attrs[:, attr_idx] == 0
+    if mask_pos.sum() == 0 or mask_neg.sum() == 0:
+        return torch.zeros(embeddings.shape[1], device=device)
+    mu_pos = embeddings[mask_pos].mean(dim=0)
+    mu_neg = embeddings[mask_neg].mean(dim=0)
+    direction = mu_pos - mu_neg
+    direction = F.normalize(direction, dim=0)
+    return direction
+
+
+def apply_global_direction_flow(
+    embeddings: torch.Tensor,
+    attrs: torch.Tensor,
+    attr_idx: int,
+    direction: torch.Tensor,
+    num_steps: int,
+    step_size: float,
+) -> torch.Tensor:
+    """
+    Deterministic baseline that translates embeddings along a single direction.
+    Negative samples move toward +d, positives move toward -d to keep symmetry.
+    """
+    if num_steps == 0:
+        return embeddings.clone()
+    z = embeddings.clone()
+    dir_vec = direction.to(z.device)
+    if dir_vec.norm() == 0:
+        return z
+    dir_vec = F.normalize(dir_vec, dim=0).unsqueeze(0)
+    signs = torch.where(attrs[:, attr_idx] > 0, 1.0, -1.0).to(z.device)
+    signs = signs.unsqueeze(-1)
+    for _ in range(num_steps):
+        z = F.normalize(z + step_size * signs * dir_vec, dim=-1)
+    return z
 
 
 def load_trained_model(
@@ -106,7 +206,7 @@ def train_linear_probes(
         clf = LogisticRegression(
             max_iter=1000,
             class_weight="balanced",
-            n_jobs=-1,
+            solver="lbfgs",
         )
         clf.fit(X_train, Y_train[:, j])
         models[attr_names[j]] = clf
@@ -320,6 +420,24 @@ def parse_args() -> argparse.Namespace:
         help="Number of flow steps to apply when computing flowed embeddings.",
     )
     parser.add_argument(
+        "--global_step_size",
+        type=float,
+        default=0.05,
+        help="Step size used for the global-direction baseline.",
+    )
+    parser.add_argument(
+        "--plot_attr",
+        type=str,
+        default="Smiling",
+        help="Attribute to visualize via PCA/UMAP plots.",
+    )
+    parser.add_argument(
+        "--plot_max_points",
+        type=int,
+        default=8000,
+        help="Max number of samples used for PCA/UMAP figures.",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="eval/metrics",
@@ -359,11 +477,16 @@ def main() -> None:
     raw_probe_models = train_linear_probes(X_train_raw, Y_train, target_attrs)
     raw_probe_results = eval_linear_probes(raw_probe_models, X_val_raw, Y_val)
 
-    print("=== Linear probes on RAW CLIP embeddings ===")
-    lines.append("=== Linear probes on RAW CLIP embeddings ===")
+    print("=== No-flow baseline (RAW CLIP embeddings, K=0) ===")
+    lines.append("=== No-flow baseline (RAW CLIP embeddings, K=0) ===")
+    raw_predictions = {}
     for attr_name, (acc, f1) in raw_probe_results.items():
         print(f"{attr_name:10s} | val_acc = {acc: .4f} | val_f1 = {f1: .4f}")
         lines.append(f"{attr_name:10s} | val_acc = {acc: .4f} | val_f1 = {f1: .4f}")
+    for j, attr_name in enumerate(target_attrs):
+        y_true = Y_val[:, j]
+        y_pred = raw_probe_models[attr_name].predict(X_val_raw)
+        raw_predictions[attr_name] = (y_true, y_pred)
 
     # Load model and compute flowed embeddings
     fallback_cfg = FCLFConfig()
@@ -393,9 +516,97 @@ def main() -> None:
     print("\n=== Linear probes on FCLF-FLOWED embeddings ===")
     lines.append("")
     lines.append("=== Linear probes on FCLF-FLOWED embeddings ===")
+    flow_predictions = {}
     for attr_name, (acc, f1) in flow_probe_results.items():
         print(f"{attr_name:10s} | val_acc = {acc: .4f} | val_f1 = {f1: .4f}")
         lines.append(f"{attr_name:10s} | val_acc = {acc: .4f} | val_f1 = {f1: .4f}")
+    for j, attr_name in enumerate(target_attrs):
+        y_true = Y_val[:, j]
+        y_pred = flow_probe_models[attr_name].predict(X_val_flow_np)
+        flow_predictions[attr_name] = (y_true, y_pred)
+
+    # Visualization: PCA/UMAP for selected attribute (raw vs flowed)
+    if args.plot_attr not in target_attrs:
+        raise ValueError(
+            f"Attribute {args.plot_attr} not in target list {target_attrs}"
+        )
+    plot_idx = target_attrs.index(args.plot_attr)
+    max_points = min(args.plot_max_points, val_split.embeddings.shape[0])
+    subset_idx = torch.randperm(val_split.embeddings.shape[0])[:max_points]
+    raw_subset = val_split.embeddings[subset_idx]
+    flow_subset = X_val_flow[subset_idx]
+    label_subset = val_attrs[:, plot_idx][subset_idx]
+    plot_pca_umap(
+        z=_to_numpy(raw_subset),
+        y=_to_numpy(label_subset),
+        attr_name=args.plot_attr,
+        title=f"Raw CLIP embeddings – {args.plot_attr}",
+        output_prefix=output_dir / f"raw_clip_{args.plot_attr.lower()}",
+    )
+    plot_pca_umap(
+        z=_to_numpy(flow_subset),
+        y=_to_numpy(label_subset),
+        attr_name=f"{args.plot_attr}",
+        title=f"Flowed embeddings – {args.plot_attr}",
+        output_prefix=output_dir / f"flowed_clip_{args.plot_attr.lower()}",
+    )
+
+    # Global-direction baseline
+    print("\n=== Global-direction baseline (same K/eps) ===")
+    lines.append("")
+    lines.append("=== Global-direction baseline (same K/eps) ===")
+    global_results = {}
+    global_predictions = {}
+    for j, attr_name in enumerate(target_attrs):
+        direction = compute_global_direction(train_split.embeddings, train_attrs, j)
+        global_train = apply_global_direction_flow(
+            embeddings=train_split.embeddings,
+            attrs=train_attrs,
+            attr_idx=j,
+            direction=direction,
+            num_steps=args.num_steps_flow,
+            step_size=args.global_step_size,
+        )
+        global_val = apply_global_direction_flow(
+            embeddings=val_split.embeddings,
+            attrs=val_attrs,
+            attr_idx=j,
+            direction=direction,
+            num_steps=args.num_steps_flow,
+            step_size=args.global_step_size,
+        )
+        global_models = train_linear_probes(
+            _to_numpy(global_train),
+            _to_numpy(train_attrs[:, [j]]),
+            [attr_name],
+        )
+        global_eval = eval_linear_probes(
+            global_models,
+            _to_numpy(global_val),
+            _to_numpy(val_attrs[:, [j]]),
+        )
+        global_results[attr_name] = global_eval[attr_name]
+        acc, f1 = global_results[attr_name]
+        y_true = _to_numpy(val_attrs[:, [j]])[:, 0]
+        y_pred = global_models[attr_name].predict(_to_numpy(global_val))
+        global_predictions[attr_name] = (y_true, y_pred)
+        print(
+            f"{attr_name:10s} | val_acc = {acc: .4f} | val_f1 = {f1: .4f} | "
+            f"K={args.num_steps_flow} | eps={args.global_step_size}"
+        )
+        lines.append(
+            f"{attr_name:10s} | val_acc = {acc: .4f} | val_f1 = {f1: .4f} | "
+            f"K={args.num_steps_flow} | eps={args.global_step_size}"
+        )
+
+    confusion_dir = output_dir / "confusion"
+    for method, pred_dict in [
+        ("raw", raw_predictions),
+        ("flow", flow_predictions),
+        ("global", global_predictions),
+    ]:
+        for attr_name, (y_true, y_pred) in pred_dict.items():
+            save_confusion_artifacts(method, attr_name, y_true, y_pred, confusion_dir)
 
     # Clustering + neighborhood purity on validation split
     from sklearn.utils import shuffle as sk_shuffle

@@ -17,6 +17,7 @@ from celeba_embeddings import (
     get_attribute_indices,
     select_attributes,
 )
+from scripts.viz_utils import plot_pca_umap
 
 
 def _to_numpy(t: torch.Tensor) -> np.ndarray:
@@ -52,7 +53,7 @@ def run_linear_probes(
         clf = LogisticRegression(
             max_iter=1000,
             class_weight="balanced",
-            n_jobs=-1,
+            solver="lbfgs",
         )
         clf.fit(X_train, y_tr)
         y_pred = clf.predict(X_val)
@@ -70,85 +71,6 @@ def run_linear_probes(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(output_lines))
     print(f"[INFO] Saved baseline metrics to {output_path}")
-
-
-def plot_pca_umap(
-    embedding_dir: str,
-    attr_name: str,
-    max_points: int,
-    output_dir: Path,
-) -> None:
-    """
-    Create PCA (and optionally UMAP) 2D plots of raw embeddings colored by a single attribute.
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    from sklearn.decomposition import PCA
-    import matplotlib.pyplot as plt
-
-    try:
-        import umap  # type: ignore
-    except ImportError:
-        umap = None
-
-    train, _, _ = load_embeddings_splits(embedding_dir)
-    attr_indices = get_attribute_indices(train.attr_names, [attr_name])
-    Y = select_attributes(train, attr_indices)[:, 0]
-
-    X = train.embeddings
-    N = X.shape[0]
-    if N > max_points:
-        idx = torch.randperm(N)[:max_points]
-        X = X[idx]
-        Y = Y[idx]
-
-    X_np = _to_numpy(X)
-    Y_np = _to_numpy(Y)
-
-    # PCA
-    pca = PCA(n_components=2)
-    X_pca = pca.fit_transform(X_np)
-
-    plt.figure(figsize=(6, 5))
-    plt.scatter(
-        X_pca[:, 0],
-        X_pca[:, 1],
-        c=Y_np,
-        cmap="coolwarm",
-        s=4,
-        alpha=0.5,
-    )
-    plt.colorbar(label=f"{attr_name} (0/1)")
-    plt.title(f"Raw CLIP embeddings PCA – colored by {attr_name}")
-    plt.tight_layout()
-    pca_path = output_dir / f"raw_clip_pca_{attr_name.lower()}.png"
-    plt.savefig(pca_path, dpi=200)
-    plt.close()
-    print(f"[INFO] Saved PCA plot to {pca_path}")
-
-    # Optional UMAP
-    if umap is not None:
-        reducer = umap.UMAP(n_components=2, random_state=0)
-        X_umap = reducer.fit_transform(X_np)
-        plt.figure(figsize=(6, 5))
-        plt.scatter(
-            X_umap[:, 0],
-            X_umap[:, 1],
-            c=Y_np,
-            cmap="coolwarm",
-            s=4,
-            alpha=0.5,
-        )
-        plt.colorbar(label=f"{attr_name} (0/1)")
-        plt.title(f"Raw CLIP embeddings UMAP – colored by {attr_name}")
-        plt.tight_layout()
-        umap_path = output_dir / f"raw_clip_umap_{attr_name.lower()}.png"
-        plt.savefig(umap_path, dpi=200)
-        plt.close()
-        print(f"[INFO] Saved UMAP plot to {umap_path}")
-    else:
-        print("[WARN] `umap-learn` is not installed; skipping UMAP plot.")
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Baseline CLIP embedding evaluations.")
@@ -192,12 +114,22 @@ if __name__ == "__main__":
     figure_dir = Path(args.figure_dir)
 
     run_linear_probes(args.embedding_dir, args.attr_names, metrics_path)
+    train, _, _ = load_embeddings_splits(args.embedding_dir)
     for attr in args.attr_names:
+        attr_indices = get_attribute_indices(train.attr_names, [attr])
+        labels = select_attributes(train, attr_indices)[:, 0]
+        embeddings = train.embeddings
+        N = embeddings.shape[0]
+        if N > args.max_points:
+            idx = torch.randperm(N)[: args.max_points]
+            embeddings = embeddings[idx]
+            labels = labels[idx]
         plot_pca_umap(
-            embedding_dir=args.embedding_dir,
+            z=_to_numpy(embeddings),
+            y=_to_numpy(labels),
             attr_name=attr,
-            max_points=args.max_points,
-            output_dir=figure_dir,
+            title=f"Raw CLIP embeddings – {attr}",
+            output_prefix=figure_dir / f"raw_clip_{attr.lower()}",
         )
 
 
