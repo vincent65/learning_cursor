@@ -16,7 +16,7 @@ import os
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from sklearn.linear_model import LogisticRegression
@@ -68,6 +68,9 @@ class ExperimentResult:
     loss_log_path: Optional[str] = None
     loss_plot_path: Optional[str] = None
     classifier_log_path: Optional[str] = None
+    baseline_path: Optional[str] = None
+    baseline_val_acc: Optional[float] = None
+    baseline_val_auc: Optional[float] = None
     aggregate_metric: Optional[float] = None
 
     def to_log_row(self) -> Dict:
@@ -85,6 +88,9 @@ class ExperimentResult:
             "loss_log_path": self.loss_log_path,
             "loss_plot_path": self.loss_plot_path,
             "classifier_log_path": self.classifier_log_path,
+            "baseline_path": self.baseline_path,
+            "baseline_val_acc": self.baseline_val_acc,
+            "baseline_val_auc": self.baseline_val_auc,
             "aggregate_metric": self.aggregate_metric,
         }
         return row
@@ -183,6 +189,7 @@ def run_experiment(
 
     base_cfg = load_yaml_config(base_config_path)
     train_cfg = _apply_overrides(base_cfg, config)
+    baseline_path, baseline_metrics = _load_or_compute_baseline(dataset_name, embedding_dir)
 
     run_id = _run_id(dataset_name, config, seed)
     run_dir = RUNS_DIR / run_id
@@ -267,14 +274,17 @@ def run_experiment(
         checkpoint_path=checkpoint_path,
         metrics_path=str(metrics_path),
         plots_dir=str(plots_dir),
-        loss_log_path=train_metadata.get("loss_log_path"),
-        loss_plot_path=loss_plot_path,
-        classifier_log_path=train_metadata.get("classifier_log_path"),
         train_acc=float(train_acc),
         val_acc=float(val_acc),
         val_auc=float(val_auc),
         within_dist=dist_metrics["within_dist"],
         between_dist=dist_metrics["between_dist"],
+        loss_log_path=train_metadata.get("loss_log_path"),
+        loss_plot_path=loss_plot_path,
+        classifier_log_path=train_metadata.get("classifier_log_path"),
+        baseline_path=str(baseline_path),
+        baseline_val_acc=baseline_metrics.get("val_acc"),
+        baseline_val_auc=baseline_metrics.get("val_auc"),
     )
     _log_result(dataset_name, result.to_log_row())
     return result
@@ -299,6 +309,9 @@ def _log_result(dataset_name: str, row: Dict) -> None:
         "loss_log_path",
         "loss_plot_path",
         "classifier_log_path",
+        "baseline_path",
+        "baseline_val_acc",
+        "baseline_val_auc",
         "train_acc",
         "val_acc",
         "val_auc",
@@ -321,6 +334,49 @@ def _log_result(dataset_name: str, row: Dict) -> None:
         entries = []
     entries.append(row)
     json_path.write_text(json.dumps(entries, indent=2))
+
+
+def _baseline_cache_path(dataset_name: str) -> Path:
+    return HP_DIR / f"{dataset_name}_baseline.json"
+
+
+def _load_or_compute_baseline(
+    dataset_name: str,
+    embedding_dir: str,
+) -> Tuple[Path, Dict[str, float]]:
+    cache_path = _baseline_cache_path(dataset_name)
+    if cache_path.exists():
+        return cache_path, json.loads(cache_path.read_text())
+
+    attr_name = _resolve_attr(dataset_name)
+    train_split, val_split, _ = load_embeddings_splits(embedding_dir)
+    attr_indices = get_attribute_indices(train_split.attr_names, [attr_name])
+    train_labels = select_attributes(train_split, attr_indices)[:, 0]
+    val_labels = select_attributes(val_split, attr_indices)[:, 0]
+
+    X_train = train_split.embeddings.cpu().numpy()
+    X_val = val_split.embeddings.cpu().numpy()
+    y_train = train_labels.cpu().numpy()
+    y_val = val_labels.cpu().numpy()
+
+    clf = _train_probe(X_train, y_train)
+    train_pred = clf.predict(X_train)
+    val_pred = clf.predict(X_val)
+    train_acc = accuracy_score(y_train, train_pred)
+    val_acc = accuracy_score(y_val, val_pred)
+    if len(np.unique(y_val)) >= 2:
+        val_auc = roc_auc_score(y_val, clf.predict_proba(X_val)[:, 1])
+    else:
+        val_auc = float("nan")
+
+    baseline = {
+        "attr_name": attr_name,
+        "train_acc": float(train_acc),
+        "val_acc": float(val_acc),
+        "val_auc": float(val_auc),
+    }
+    cache_path.write_text(json.dumps(baseline, indent=2))
+    return cache_path, baseline
 
 
 def _aggregate_results(
