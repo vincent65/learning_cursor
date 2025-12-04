@@ -191,6 +191,8 @@ def run_experiment(
     train_cfg = _apply_overrides(base_cfg, config)
     baseline_path, baseline_metrics = _load_or_compute_baseline(dataset_name, embedding_dir)
 
+    train_split, val_split, _ = load_embeddings_splits(embedding_dir)
+
     run_id = _run_id(dataset_name, config, seed)
     run_dir = RUNS_DIR / run_id
     checkpoints_dir = run_dir / "checkpoints"
