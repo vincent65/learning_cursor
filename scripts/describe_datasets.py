@@ -144,7 +144,7 @@ def parse_args() -> argparse.Namespace:
         "--plot_attrs",
         type=str,
         nargs="*",
-        default=["Eyeglasses", "Smiling"],
+        default=["Eyeglasses", "Smiling", "Young", "Mustache", "Male"],
         help="Attributes to visualize via PCA/UMAP.",
     )
     parser.add_argument(
